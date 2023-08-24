@@ -220,6 +220,11 @@ impl<T> ObjRef<T> {
         self.cache.0.lock().dirty.insert(inner.as_ptr());
         Some(())
     }
+
+    pub fn flush_dirty(&mut self) {
+        let inner = self.inner.as_mut().unwrap();
+        inner.flush_dirty();
+    }
 }
 
 impl<T> Deref for ObjRef<T> {
