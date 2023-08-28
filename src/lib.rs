@@ -142,6 +142,9 @@ pub trait TypedView<T: ?Sized>: Deref<Target = T> {
     /// Returns if the typed content is memory-mapped (i.e., all changes through `write` are auto
     /// reflected in the underlying [MemStore]).
     fn is_mem_mapped(&self) -> bool;
+
+    #[cfg(feature="sized_cache")]
+    fn mem_size(&self) -> usize;
 }
 
 /// A wrapper of `TypedView` to enable writes. The direct construction (by [Obj::from_typed_view]
@@ -158,6 +161,12 @@ impl<T: ?Sized> Obj<T> {
     pub fn as_ptr(&self) -> ObjPtr<T> {
         ObjPtr::<T>::new(self.value.get_offset())
     }
+  
+    #[cfg(feature="sized_cache")]
+    fn mem_size(&self) -> usize {
+        self.value.mem_size()
+    }
+
 }
 
 impl<T: ?Sized> Obj<T> {
@@ -242,7 +251,21 @@ impl<T> Drop for ObjRef<T> {
         if cache.pinned.remove(&ptr).unwrap() {
             inner.dirty = None;
         } else {
+            #[cfg(feature="sized_cache")] {
+                cache.cached_size += inner.mem_size();
+            }
             cache.cached.put(ptr, inner);
+            #[cfg(feature="sized_cache")] 
+            while cache.cached_size > cache.cached_capacity {
+                if let Some((ptr, mut r)) = cache.cached.pop_lru() {
+                    cache.cached_size -= r.mem_size();
+                    if let Some(f) = cache.pinned.get_mut(&ptr) {
+                        *f = true
+                    }
+                    cache.dirty.remove(&ptr);
+                    r.dirty = None;
+                }
+            }
         }
     }
 }
@@ -298,6 +321,7 @@ impl<T> Deref for MummyObj<T> {
     }
 }
 
+#[cfg(not(feature="sized_cache"))]
 impl<T: MummyItem> TypedView<T> for MummyObj<T> {
     fn get_offset(&self) -> u64 {
         self.offset
@@ -323,8 +347,47 @@ impl<T: MummyItem> TypedView<T> for MummyObj<T> {
     fn write(&mut self) -> &mut T {
         &mut self.decoded
     }
+
     fn is_mem_mapped(&self) -> bool {
         self.decoded.is_mem_mapped()
+    }
+
+}
+
+#[cfg(feature="sized_cache")]
+impl<T: MummyItem> TypedView<T> for MummyObj<T> {
+
+    fn get_offset(&self) -> u64 {
+        self.offset
+    }
+
+    fn get_mem_store(&self) -> &dyn MemStore {
+        &**self.mem
+    }
+
+    fn estimate_mem_image(&self) -> Option<u64> {
+        let len = self.decoded.dehydrated_len();
+        if len as u64 > self.len_limit {
+            None
+        } else {
+            Some(len)
+        }
+    }
+
+    fn write_mem_image(&self, mem_image: &mut [u8]) {
+        self.decoded.dehydrate(mem_image)
+    }
+
+    fn write(&mut self) -> &mut T {
+        &mut self.decoded
+    }
+
+    fn is_mem_mapped(&self) -> bool {
+        self.decoded.is_mem_mapped()
+    }
+
+    fn mem_size(&self) -> usize {
+        self.decoded.dehydrated_len() as usize
     }
 }
 
@@ -520,12 +583,17 @@ struct ObjCacheInner<T: ?Sized> {
     cached: lru::LruCache<ObjPtr<T>, Obj<T>>,
     pinned: HashMap<ObjPtr<T>, bool>,
     dirty: HashSet<ObjPtr<T>>,
+    #[cfg(feature="sized_cache")]
+    cached_size: usize,
+    #[cfg(feature="sized_cache")]
+    cached_capacity: usize,
 }
 
 /// [ObjRef] pool that is used by [ShaleStore] implementation to construct [ObjRef]s.
 pub struct ObjCache<T: ?Sized>(Arc<Mutex<ObjCacheInner<T>>>);
 
 impl<T> ObjCache<T> {
+    #[cfg(not(feature="sized_cache"))]
     pub fn new(capacity: usize) -> Self {
         Self(Arc::new(Mutex::new(ObjCacheInner {
             cached: lru::LruCache::new(
@@ -536,10 +604,25 @@ impl<T> ObjCache<T> {
         })))
     }
 
+    #[cfg(feature="sized_cache")]
+    pub fn new(capacity: usize) -> Self {
+        Self(Arc::new(Mutex::new(ObjCacheInner {
+            cached: lru::LruCache::unbounded(),
+            pinned: HashMap::new(),
+            dirty: HashSet::new(),
+            cached_size: 0,
+            cached_capacity: capacity,
+        })))
+    }
+
     #[inline(always)]
     pub fn get(&self, ptr: ObjPtr<T>) -> Result<Option<ObjRef<T>>, ShaleError> {
         let inner = &mut self.0.lock();
         if let Some(r) = inner.cached.pop(&ptr) {
+            #[cfg(feature="sized_cache")] {
+                inner.cached_size -= r.mem_size();
+            }
+
             if inner.pinned.insert(ptr, false).is_some() {
                 return Err(ShaleError::ObjRefAlreadyInUse)
             }
@@ -568,6 +651,9 @@ impl<T> ObjCache<T> {
             *f = true
         }
         if let Some(mut r) = inner.cached.pop(&ptr) {
+            #[cfg(feature="sized_cache")] {
+                inner.cached_size -= r.mem_size();
+            }
             r.dirty = None
         }
         inner.dirty.remove(&ptr);
