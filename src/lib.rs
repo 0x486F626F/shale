@@ -252,18 +252,14 @@ impl<T> Drop for ObjRef<T> {
             inner.dirty = None;
         } else {
             #[cfg(feature="sized_cache")] {
-                cache.cached_size += inner.mem_size();
+                cache.cached_size += (32 + inner.mem_size());
             }
             cache.cached.put(ptr, inner);
             #[cfg(feature="sized_cache")] 
             while cache.cached_size > cache.cached_capacity {
-                if let Some((ptr, mut r)) = cache.cached.pop_lru() {
-                    cache.cached_size -= r.mem_size();
-                    if let Some(f) = cache.pinned.get_mut(&ptr) {
-                        *f = true
-                    }
-                    cache.dirty.remove(&ptr);
-                    r.dirty = None;
+                if let Some((_, r)) = cache.cached.pop_lru() {
+                    cache.stats.nevicted += 1;
+                    cache.cached_size -= (32 + r.mem_size());
                 }
             }
         }
@@ -283,6 +279,9 @@ pub trait ShaleStore<T> {
     fn free_item(&mut self, item: ObjPtr<T>) -> Result<(), ShaleError>;
     /// Flush all dirty writes.
     fn flush_dirty(&self) -> Option<()>;
+
+    #[cfg(feature="cache_stats")]
+    fn stats(&self) -> ObjCacheStats;
 }
 
 /// A stored item type that can be decoded from or encoded to on-disk raw bytes. An efficient
@@ -356,7 +355,6 @@ impl<T: MummyItem> TypedView<T> for MummyObj<T> {
 
 #[cfg(feature="sized_cache")]
 impl<T: MummyItem> TypedView<T> for MummyObj<T> {
-
     fn get_offset(&self) -> u64 {
         self.offset
     }
@@ -579,6 +577,39 @@ impl Deref for PlainMemShared {
 
 impl MemView for PlainMemView {}
 
+
+#[cfg(feature="cache_stats")]
+#[derive(Clone)]
+pub struct ObjCacheStats {
+    pub hit: usize,
+    pub miss: usize,
+    pub ncached: usize,
+    pub nevicted: usize,
+    pub t_miss: f64,
+    pub t_miss_cnt: usize,
+}
+
+impl ObjCacheStats {
+    pub fn new() -> Self {
+        Self {
+            hit: 0,
+            miss: 0,
+            ncached: 0,
+            nevicted: 0,
+            t_miss: 0.0,
+            t_miss_cnt: 0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.hit = 0;
+        self.miss = 0;
+        self.nevicted = 0;
+        self.t_miss = 0.0;
+        self.t_miss_cnt = 0;
+    }
+}
+
 struct ObjCacheInner<T: ?Sized> {
     cached: lru::LruCache<ObjPtr<T>, Obj<T>>,
     pinned: HashMap<ObjPtr<T>, bool>,
@@ -587,6 +618,8 @@ struct ObjCacheInner<T: ?Sized> {
     cached_size: usize,
     #[cfg(feature="sized_cache")]
     cached_capacity: usize,
+    #[cfg(feature="cache_stats")]
+    pub stats: ObjCacheStats,
 }
 
 /// [ObjRef] pool that is used by [ShaleStore] implementation to construct [ObjRef]s.
@@ -612,15 +645,26 @@ impl<T> ObjCache<T> {
             dirty: HashSet::new(),
             cached_size: 0,
             cached_capacity: capacity,
+            #[cfg(feature="cache_stats")]
+            stats: ObjCacheStats::new(),
         })))
+    }
+
+    pub fn update_t_miss(&self, t: f64) {
+        let inner = &mut self.0.lock();
+        inner.stats.t_miss += t;
+        inner.stats.t_miss_cnt += 1;
     }
 
     #[inline(always)]
     pub fn get(&self, ptr: ObjPtr<T>) -> Result<Option<ObjRef<T>>, ShaleError> {
         let inner = &mut self.0.lock();
         if let Some(r) = inner.cached.pop(&ptr) {
+            #[cfg(feature="cache_stats")] {
+                inner.stats.hit += 1;
+            }
             #[cfg(feature="sized_cache")] {
-                inner.cached_size -= r.mem_size();
+                inner.cached_size -= (r.mem_size() + 32);
             }
 
             if inner.pinned.insert(ptr, false).is_some() {
@@ -630,6 +674,9 @@ impl<T> ObjCache<T> {
                 inner: Some(r),
                 cache: Self(self.0.clone()),
             }))
+        }
+        #[cfg(feature="cache_stats")] {
+            inner.stats.miss += 1;
         }
         Ok(None)
     }
@@ -652,11 +699,25 @@ impl<T> ObjCache<T> {
         }
         if let Some(mut r) = inner.cached.pop(&ptr) {
             #[cfg(feature="sized_cache")] {
-                inner.cached_size -= r.mem_size();
+                inner.cached_size -= (r.mem_size() + 32);
             }
             r.dirty = None
         }
         inner.dirty.remove(&ptr);
+    }
+
+    #[cfg(feature="cache_stats")]
+    pub fn get_stats(&self) -> ObjCacheStats {
+        let inner = self.0.lock();
+        let mut stats = inner.stats.clone();
+        stats.ncached = inner.cached.len();
+        stats
+    }
+
+    #[cfg(feature="cache_stats")]
+    pub fn reset_stats(&self) {
+        let mut inner = self.0.lock();
+        inner.stats.reset();
     }
 
     pub fn flush_dirty(&self) -> Option<()> {

@@ -1,5 +1,6 @@
 use super::{
     MemStore, MummyItem, MummyObj, Obj, ObjPtr, ObjRef, ShaleError, ShaleStore,
+    ObjCacheStats,
 };
 use std::cell::UnsafeCell;
 use std::io::{Cursor, Write};
@@ -633,5 +634,13 @@ impl<T: MummyItem + 'static> ShaleStore<T> for CompactSpace<T> {
         let inner = unsafe { &mut *self.inner.get() };
         inner.header.flush_dirty();
         inner.obj_cache.flush_dirty()
+    }
+
+    #[cfg(feature="cache_stats")]
+    fn stats(&self) -> ObjCacheStats {
+        let inner = unsafe { &*self.inner.get() };
+        let stats = inner.obj_cache.get_stats();
+        inner.obj_cache.reset_stats();
+        stats
     }
 }
