@@ -1,6 +1,5 @@
 use super::{
     MemStore, MummyItem, MummyObj, Obj, ObjPtr, ObjRef, ShaleError, ShaleStore,
-    ObjCacheStats,
 };
 use std::cell::UnsafeCell;
 use std::io::{Cursor, Write};
